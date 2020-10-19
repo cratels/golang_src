@@ -159,15 +159,18 @@ const (
 	_PageMask = _PageSize - 1
 
 	// _64bit = 1 on 64-bit systems, 0 on 32-bit systems
+	// 移位操作的速度是最快的，所以源码中总是偏向于使用移位操作来取代其他操作，比如这里的条件判断。
 	_64bit = 1 << (^uintptr(0) >> 63) / 2
 
 	// Tiny allocator parameters, see "Tiny allocator" comment in malloc.go.
 	_TinySize      = 16
 	_TinySizeClass = int8(2)
 
+	//fixAlloc的块大小，这里是16kB，因为小对象的最大值也就是16kB
 	_FixAllocChunk = 16 << 10 // Chunk size for FixAlloc
 
 	// Per-P, per order stack segment cache size.
+	//一个P对应的cache大小为32KB
 	_StackCacheSize = 32 * 1024
 
 	// Number of orders that get caching. Order 0 is FixedStack
@@ -352,6 +355,7 @@ const (
 	minLegalPointer uintptr = 4096
 )
 
+//操作系统的页大小
 // physPageSize is the size in bytes of the OS's physical pages.
 // Mapping and unmapping operations must be done at multiples of
 // physPageSize.
