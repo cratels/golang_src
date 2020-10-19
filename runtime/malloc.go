@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // Memory allocator.内存分配器
-//golang的内存分配是基于tcmalloc实现的，虽然在实现细节上略有差异，但是基本原理是一样的。
+// golang的内存分配是基于tcmalloc实现的，虽然在实现细节上略有差异，但是基本原理是一样的。
 // This was originally based on tcmalloc, but has diverged quite a bit.
 // http://goog-perftools.sourceforge.net/doc/tcmalloc.html
 
@@ -14,18 +14,25 @@
 // Any free page of memory can be split into a set of objects
 // of one size class, which are then managed using a free bitmap.
 //
-// 内存分配是基于page进行工作的。在进行小对象（<32kB）内存分配时，这些对象被映射到事先定义的70个大小级别上。
+// 内存分配是基于page进行工作的。在进行小对象（<32kB）内存分配时，这些对象
+// 被映射到事先定义的70个大小级别上。
 // 每一个级别都拥有一个自己的free集合，使用空闲位图来标定这些空闲的位置。
 //
 // The allocator's data structures are:
 //
 //	fixalloc: a free-list allocator for fixed-size off-heap objects,
 //		used to manage storage used by the allocator.
+// 	针对free-list的分配器，用于管理非堆区域的对象分配。
 //	mheap: the malloc heap, managed at page (8192-byte) granularity.
+// 	内存管理的最小单元是page（8kB）
 //	mspan: a run of in-use pages managed by the mheap.
+// 	一系列使用中的page组成的内存块称为span
 //	mcentral: collects all spans of a given size class.
+// 	所有70个size级别对应的span的集合
 //	mcache: a per-P cache of mspans with free space.
+// 	P持有的，用于管理所有size class的span的free-list集合
 //	mstats: allocation statistics.
+// 	分配统计单元
 //
 // Allocating a small object proceeds up a hierarchy of caches:
 //
@@ -34,46 +41,64 @@
 //	   Scan the mspan's free bitmap to find a free slot.
 //	   If there is a free slot, allocate it.
 //	   This can all be done without acquiring a lock.
+// 	向上取整到最小的size class C，查找当前P中C对应的span中的是否有空闲位置。
+// 	怎样查找是否有空闲位置呢？C对应的span的空闲信息，GC信息都会映射到对应的
+// 	bitmap单元，在bitmap里面可以快速查找。此时完全不需要加锁操作。
 //
 //	2. If the mspan has no free slots, obtain a new mspan
 //	   from the mcentral's list of mspans of the required size
 //	   class that have free space.
 //	   Obtaining a whole span amortizes the cost of locking
 //	   the mcentral.
+// 	如果当前span没有空闲位置，则从central里面拉取一个新的span过来
+//	此时需要对central进行加锁操作。
 //
 //	3. If the mcentral's mspan list is empty, obtain a run
 //	   of pages from the mheap to use for the mspan.
+// 	如果此时central中的对应span也没有空闲的，则需要从heap中拉一系列page过来用。
+// 	至于到底是多少个page，需要查看当前span包含多少个page，这在go里面是固定写好的。
+// 	牵扯到数学计算，这里就不展开了。
 //
 //	4. If the mheap is empty or has no page runs large enough,
 //	   allocate a new group of pages (at least 1MB) from the
 //	   operating system. Allocating a large run of pages
 //	   amortizes the cost of talking to the operating system.
+// 	如果此时heap里面已经没有多余内存了，则需要进程想OS去申请内存（最少1MB）
 //
 // Sweeping an mspan and freeing objects on it proceeds up a similar
 // hierarchy:
-//
+// 内存清理与释放的流程
 //	1. If the mspan is being swept in response to allocation, it
 //	   is returned to the mcache to satisfy the allocation.
-//
+// 	内存回收的步骤，注意这里是回收，回收的内存可能并没有还给系统，而是继续被其他代码使用。
+//	小对象进行内存回收时，是直接将空闲出来的内存返回给cache上对应class的free-list的。
+//	只需更新span对应的bitmap信息即可。
 //	2. Otherwise, if the mspan still has allocated objects in it,
 //	   it is placed on the mcentral free list for the mspan's size
 //	   class.
+//	TODO：不是很理解
 //
 //	3. Otherwise, if all objects in the mspan are free, the mspan's
 //	   pages are returned to the mheap and the mspan is now dead.
 //
 // Allocating and freeing a large object uses the mheap
 // directly, bypassing the mcache and mcentral.
+// 大对象直接在heap上进行内存分配，而不是使用cache和central
 //
 // If mspan.needzero is false, then free object slots in the mspan are
-// already zeroed. Otherwise if needzero is true, objects are zeroed as
-// they are allocated. There are various benefits to delaying zeroing
-// this way:
+// already zeroed.Otherwise if needzero is true, objects are zeroed as
+// they are allocated.
+// 如果span的needzero属性为false，说明空闲的内存已经全部进行了置零操作。
+// 反之，则需要在进行内存分配之前进行置零操作。
+// 为什么不在每次归还内存的时候直接进行置零操作，而是推迟到重新分配的时候呢？
+// 下文介绍了不这样做的原因。
+
+// There are various benefits to delaying zeroing this way:
 //
 //	1. Stack frame allocation can avoid zeroing altogether.
 //
 //	2. It exhibits better temporal locality, since the program is
-//	   probably about to write to the memory.
+//	   probably about to write to the memory.（没必要，反正程序会再写一遍。）
 //
 //	3. We don't zero pages that never get reused.
 
@@ -82,11 +107,13 @@
 // The heap consists of a set of arenas, which are 64MB on 64-bit and
 // 4MB on 32-bit (heapArenaBytes). Each arena's start address is also
 // aligned to the arena size.
+// heap由一系列arenas组成，每个arena在64位操作系统上的大小为64MB。
+// arena的大小在程序中使用heapArenaBytes表示
 //
 // Each arena has an associated heapArena object that stores the
 // metadata for that arena: the heap bitmap for all words in the arena
 // and the span map for all pages in the arena. heapArena objects are
-// themselves allocated off-heap.
+// themselves allocated off-heap.堆外分配
 //
 // Since arenas are aligned, the address space can be viewed as a
 // series of arena frames. The arena map (mheap_.arenas) maps from
@@ -113,17 +140,19 @@ import (
 const (
 	debugMalloc = false
 
-	maxTinySize   = _TinySize
-	tinySizeClass = _TinySizeClass
-	maxSmallSize  = _MaxSmallSize
+	maxTinySize   = _TinySize      //tiny对象的分界值，即tiny对象的最大值：16kB
+	tinySizeClass = _TinySizeClass //tiny对象对应的size class？为什么不直接通过数组去获取，而是在这里写定？
+	maxSmallSize  = _MaxSmallSize  //小对象的分界值，即小对象的最大值：32kB
 
-	pageShift = _PageShift
-	pageSize  = _PageSize
-	pageMask  = _PageMask
+	pageShift = _PageShift //13，因为Go规定page的大小为8kB，而2^13=8k,所以这里是13。表征进行移位的位数
+	pageSize  = _PageSize  //8KB
+	pageMask  = _PageMask  //TODO
 	// By construction, single page spans of the smallest object class
 	// have the most objects per span.
+	//在size class的定义里面，最小的object size为8（0是其他用途），所以一个span里面最大可能储存的对象个数是除以8的数字。
 	maxObjsPerSpan = pageSize / 8
 
+	//是否开启并发清除操作
 	concurrentSweep = _ConcurrentSweep
 
 	_PageSize = 1 << _PageShift
