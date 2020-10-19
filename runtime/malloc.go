@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Memory allocator.
-//
+// Memory allocator.内存分配器
+//golang的内存分配是基于tcmalloc实现的，虽然在实现细节上略有差异，但是基本原理是一样的。
 // This was originally based on tcmalloc, but has diverged quite a bit.
 // http://goog-perftools.sourceforge.net/doc/tcmalloc.html
 
@@ -13,6 +13,9 @@
 // has its own free set of objects of exactly that size.
 // Any free page of memory can be split into a set of objects
 // of one size class, which are then managed using a free bitmap.
+//
+// 内存分配是基于page进行工作的。在进行小对象（<32kB）内存分配时，这些对象被映射到事先定义的70个大小级别上。
+// 每一个级别都拥有一个自己的free集合，使用空闲位图来标定这些空闲的位置。
 //
 // The allocator's data structures are:
 //
